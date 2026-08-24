@@ -28,11 +28,13 @@ python photo_organizer.py --dir "相册路径" --apply --yes
 # 后悔了？一键回滚
 python photo_organizer.py --dir "相册路径" --rollback
 
-# 3. 清除纯低清版 (同内容等比缩放, 无色差无裁剪, 仅分辨率低的版本)
-python photo_organizer.py --dir "相册路径" --purge-lowres                    # 干跑: 列出低清清单
+# 3. 清除冗余版本 (移动而非删除, 可回滚)
+python photo_organizer.py --dir "相册路径" --purge-lowres                    # 纯低清版(同内容等比缩放, 分辨率显著低)
+python photo_organizer.py --dir "相册路径" --purge-visual-dup               # 视觉重复(同分辨率同内容, 仅编码不同)
 python photo_organizer.py --dir "相册路径" --purge-lowres --apply --yes      # 执行: 移动到 _lowres/
-python photo_organizer.py --dir "相册路径" --purge-lowres --to "D:/低清回收" # 指定移动目标目录
+python photo_organizer.py --dir "相册路径" --purge-visual-dup --apply --yes  # 执行: 移动到 _visual_dup/
 python photo_organizer.py --dir "相册路径" --rollback-lowres                 # 按 lowres_map.csv 移回
+python photo_organizer.py --dir "相册路径" --rollback-visual-dup             # 按 visual_dup_map.csv 移回
 
 # 4. 独有图片筛选复制（--base 是参照库根目录）
 python unique_copy.py --src "源目录" --dst "目标目录" --base "图库根目录" --copy

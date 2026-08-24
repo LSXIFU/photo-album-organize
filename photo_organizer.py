@@ -33,6 +33,7 @@ import cv2
 EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff', '.jfif'}
 CSV_NAME = 'rename_map.csv'
 LOWRES_CSV_NAME = 'lowres_map.csv'
+VDUP_CSV_NAME = 'visual_dup_map.csv'
 
 # ---- 可调参数(粗筛) ----
 HIST_BINS = (8, 6, 3)      # HSV 量化 bin
@@ -54,6 +55,8 @@ LOWRES_PIX_RATIO = 0.60    # 低清像素数 < 高清像素数的该比例 才�
 LOWRES_ASPECT_TOL = 0.03   # 宽高比容差(纯缩放必须一致)
 SCALE_UP_DROP = 0.03       # 反向比较: sim(高清→低清) - sim(低清→高清) 超过该值
                            # → 低清只是高清的局部巧合(如拼贴图的一个元素), 拒绝
+VISUAL_DUP_THRESH = 0.97   # 视觉重复: 分辨率接近(≥90%)且双向相似度 ≥ 该值 → 同图仅编码不同
+VISUAL_DUP_PIX_RATIO = 0.90  # 分辨率接近阈值(像素比下限)
 
 
 # ------------------------------------------------------------------ IO
@@ -344,6 +347,39 @@ def is_pure_downscale(img_high, size_h, img_low, size_l):
     return True
 
 
+def is_visual_dup(img_high, size_h, img_low, size_l):
+    """img_low 是否与 img_high 视觉重复(同内容同分辨率级别, 仅编码不同)。
+    JPEG/PNG 编码非唯一: 同像素内容不同压缩/保存 → 字节哈希不同但视觉一致"""
+    px_h = size_h[0] * size_h[1]
+    px_l = size_l[0] * size_l[1]
+    if px_l < px_h * VISUAL_DUP_PIX_RATIO:   # 分辨率差太多(>10%) → 不是视觉重复
+        return False
+    sd = scale_similarity(img_high, img_low)
+    su = scale_similarity_up(img_high, img_low)
+    return min(sd, su) >= VISUAL_DUP_THRESH
+
+
+def find_visual_dup(images, sizes, thumbs, groups):
+    """返回 [(dup_idx, keep_idx)]: 组内两两比较, 分辨率接近且像素一致的(编码不同副本)。
+    必须两两比较: 组内可能有多个同分辨率副本, 而最高清可能是另一内容(漏检源)"""
+    dups = []
+    for g in groups:
+        if len(g) < 2:
+            continue
+        members = sorted(g, key=lambda i: sizes[i][0] * sizes[i][1], reverse=True)
+        for k, low_i in enumerate(members):
+            if thumbs[low_i] is None:
+                continue
+            for high_i in members[:k]:          # 比 low_i 更大的成员
+                if thumbs[high_i] is None:
+                    continue
+                if is_visual_dup(thumbs[high_i], sizes[high_i],
+                                 thumbs[low_i], sizes[low_i]):
+                    dups.append((low_i, high_i))
+                    break                        # 找到一张即可, 不重复标记
+    return dups
+
+
 def find_lowres(images, sizes, thumbs, groups):
     """返回 [(low_idx, keep_idx)]: 组内相对最高清为纯低清版的索引对。
     每个组以像素最大的成员为基准, 其余成员逐个判定"""
@@ -381,6 +417,56 @@ class UnionFind:
 
 
 # ------------------------------------------------------------------ 主流程
+def purge_runner(d, images, sizes, thumbs, groups, find_fn, csv_name, subdir,
+                 label, apply, yes, to_dir):
+    """通用: 找出冗余版本(find_fn) → 干跑报告 → apply 移动到 subdir → CSV 记录(可回滚)"""
+    hits = find_fn(images, sizes, thumbs, groups)
+    if not hits:
+        print(f"[i] 未发现{label}")
+        return 0
+    print(f"\n======== {label}清单 ({len(hits)} 个) ========")
+    for low_i, keep_i in hits:
+        lh, lw = sizes[low_i]
+        sh, sw = sizes[keep_i]
+        print(f"  [{label}] {images[low_i].name}  ({lw}x{lh})"
+              f"  ← 保留 {images[keep_i].name}  ({sw}x{sh})")
+    print("============================\n")
+    csv_path = d / csv_name
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['file', 'kept_with', 'moved_to'])
+        for low_i, keep_i in hits:
+            w.writerow([images[low_i].name, images[keep_i].name, subdir])
+    print(f"[i] {label}清单已写: {csv_path}")
+    if not apply:
+        print("[i] 干跑模式 — 未移动任何文件。确认后加 --apply 执行移动")
+        return 0
+    if not yes:
+        r = input(f"确认移动 {len(hits)} 个{label}到 {to_dir or (subdir + '/')}? [y/N] ").strip().lower()
+        if r != 'y':
+            print("[i] 已取消")
+            return 0
+    target = Path(to_dir) if to_dir else (d / subdir)
+    target.mkdir(parents=True, exist_ok=True)
+    done = 0
+    for low_i, keep_i in hits:
+        src = d / images[low_i].name
+        dst = target / images[low_i].name
+        if not src.exists():
+            print(f"[!] 源不存在, 跳过: {src.name}")
+            continue
+        if dst.exists():          # 目标重名保底: 加序号, 绝不覆盖
+            stem, ext = src.stem, src.suffix
+            k = 1
+            while dst.exists():
+                dst = target / f"{stem}_{k}{ext}"
+                k += 1
+        src.rename(dst)
+        done += 1
+    print(f"[✓] 已移动 {done}/{len(hits)} 个{label}到 {target}  (清单 {csv_name}, 可回滚)")
+    return 0
+
+
 def plan_renames(images, sizes, tones, groups):
     """全量重命名(不保留源文件名): {组号:03d}_{色调}_{序号:02d}.
     组内像素降序 → 完整版在前; 组号由调用方按原文件名排序分配"""
@@ -404,7 +490,7 @@ def plan_renames(images, sizes, tones, groups):
 
 
 def run_dir(d: Path, apply: bool, yes: bool, purge_lowres: bool = False,
-            to_dir: str = None):
+            purge_visual_dup: bool = False, to_dir: str = None):
     images = scan_images(d)
     if not images:
         print(f"[!] 目录下没有图片: {d}")
@@ -484,55 +570,17 @@ def run_dir(d: Path, apply: bool, yes: bool, purge_lowres: bool = False,
     groups.sort(key=lambda g: min(Path(images[i]).name for i in g))
     print(f"[i] 形成 {len(groups)} 个组 (含单图)  用时 {time.time()-t0:.1f}s")
 
-    # --- 3b) 纯低清版清除 (可选 --purge-lowres, 独立于重命名) ---
-    if purge_lowres:
+    # --- 3b) 冗余版本清除 (--purge-lowres / --purge-visual-dup, 独立于重命名) ---
+    if purge_lowres or purge_visual_dup:
         # 像素比必须用原始尺寸(缩略图都压到512, 丢失像素关系)
         orig_sizes = [exif_corrected_size(p) for p in images]
-        lowres = find_lowres(images, orig_sizes, thumbs, groups)
-        if not lowres:
-            print("[i] 未发现纯低清版 (同内容等比缩放且像素显著低的)")
-            return 0
-        print(f"\n======== 纯低清版清单 ({len(lowres)} 个) ========")
-        for low_i, keep_i in lowres:
-            lh, lw = orig_sizes[low_i]
-            sh, sw = orig_sizes[keep_i]
-            print(f"  [低清] {images[low_i].name}  ({lw}x{lh})"
-                  f"  ← 保留 {images[keep_i].name}  ({sw}x{sh})")
-        print("============================\n")
-        csv_path = d / LOWRES_CSV_NAME
-        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-            w = csv.writer(f)
-            w.writerow(['file', 'kept_with', 'moved_to'])
-            for low_i, keep_i in lowres:
-                w.writerow([images[low_i].name, images[keep_i].name, '_lowres'])
-        print(f"[i] 低清清单已写: {csv_path}")
-        if not apply:
-            print("[i] 干跑模式 — 未移动任何文件。确认后加 --apply 执行移动")
-            return 0
-        if not yes:
-            r = input(f"确认移动 {len(lowres)} 个低清版到 {to_dir or '_lowres/'}? [y/N] ").strip().lower()
-            if r != 'y':
-                print("[i] 已取消")
-                return 0
-        target = Path(to_dir) if to_dir else (d / '_lowres')
-        target.mkdir(parents=True, exist_ok=True)
-        done = 0
-        for low_i, keep_i in lowres:
-            src = d / images[low_i].name
-            dst = target / images[low_i].name
-            if not src.exists():
-                print(f"[!] 源不存在, 跳过: {src.name}")
-                continue
-            if dst.exists():          # 目标重名保底: 加序号, 绝不覆盖
-                stem, ext = src.stem, src.suffix
-                k = 1
-                while dst.exists():
-                    dst = target / f"{stem}_{k}{ext}"
-                    k += 1
-            src.rename(dst)
-            done += 1
-        print(f"[✓] 已移动 {done}/{len(lowres)} 个低清版到 {target}  (清单 {LOWRES_CSV_NAME}, 可 --rollback-lowres)")
-        return 0
+        if purge_lowres:
+            return purge_runner(d, images, orig_sizes, thumbs, groups,
+                                find_lowres, LOWRES_CSV_NAME, '_lowres', '纯低清版',
+                                apply, yes, to_dir)
+        return purge_runner(d, images, orig_sizes, thumbs, groups,
+                            find_visual_dup, VDUP_CSV_NAME, '_visual_dup', '视觉重复',
+                            apply, yes, to_dir)
 
     # --- 4) 排序 + 命名计划 ---
     plan, stats = plan_renames(images, sizes, tones, groups)
@@ -610,9 +658,9 @@ def do_rollback(d: Path):
     return 0
 
 
-def do_rollback_lowres(d: Path):
-    """按 lowres_map.csv 把移走的低清版移回原目录"""
-    csv_path = d / LOWRES_CSV_NAME
+def do_rollback_purge(d: Path, csv_name: str):
+    """按 purge csv (file, kept_with, moved_to) 把移走的文件移回原目录"""
+    csv_path = d / csv_name
     if not csv_path.exists():
         print(f"[!] 找不到 {csv_path}, 无法回滚")
         return 1
@@ -628,7 +676,7 @@ def do_rollback_lowres(d: Path):
         if src.exists() and not dst.exists():
             src.rename(dst)
             done += 1
-    print(f"[✓] 已移回 {done}/{len(rows)} 个低清版")
+    print(f"[✓] 已移回 {done}/{len(rows)} 个文件")
     return 0
 
 
@@ -640,10 +688,14 @@ def main():
     ap.add_argument('--rollback', action='store_true', help='按 rename_map.csv 回滚重命名')
     ap.add_argument('--purge-lowres', action='store_true',
                     help='清除纯低清版(同内容等比缩放, 移动而非删除)')
+    ap.add_argument('--purge-visual-dup', action='store_true',
+                    help='清除视觉重复(同分辨率同内容仅编码不同, 移动而非删除)')
     ap.add_argument('--to', default=None,
-                    help='低清版移动目标目录(默认 <dir>/_lowres)')
+                    help='冗余文件移动目标目录(默认 <dir>/_lowres 或 <dir>/_visual_dup)')
     ap.add_argument('--rollback-lowres', action='store_true',
                     help='按 lowres_map.csv 把低清版移回原目录')
+    ap.add_argument('--rollback-visual-dup', action='store_true',
+                    help='按 visual_dup_map.csv 把视觉重复移回原目录')
     a = ap.parse_args()
 
     d = Path(a.dir)
@@ -654,8 +706,10 @@ def main():
     if a.rollback:
         sys.exit(do_rollback(d))
     if a.rollback_lowres:
-        sys.exit(do_rollback_lowres(d))
-    sys.exit(run_dir(d, a.apply, a.yes, a.purge_lowres, a.to))
+        sys.exit(do_rollback_purge(d, LOWRES_CSV_NAME))
+    if a.rollback_visual_dup:
+        sys.exit(do_rollback_purge(d, VDUP_CSV_NAME))
+    sys.exit(run_dir(d, a.apply, a.yes, a.purge_lowres, a.purge_visual_dup, a.to))
 
 
 if __name__ == '__main__':
