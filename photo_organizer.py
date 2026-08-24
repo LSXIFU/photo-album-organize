@@ -59,6 +59,8 @@ VISUAL_DUP_THRESH = 0.97   # 视觉重复: 分辨率接近(≥90%)且双向相�
 VISUAL_DUP_PIX_RATIO = 0.90  # 分辨率接近阈值(像素比下限)
 VISUAL_DUP_HIST_THRESH = 0.5  # HSV直方图卡方距离上限: 超过→色调不同(如暖/冷版本), 拒绝
                             # (同色重压缩≈0.0-0.1, 色调不同版本≈1.0-2.5)
+AUTO_MOVE_DIFF = 0.005      # 视觉重复自动移动的可见差异率上限(>0.5%说明含水印/文字/调色等
+                            # 附加信息版本, 需人工决定; 纯编码副本≈0%)
 
 
 # ------------------------------------------------------------------ IO
@@ -368,9 +370,22 @@ def is_visual_dup(img_high, size_h, img_low, size_l):
     return True
 
 
+def visible_diff_ratio(img_hi, img_lo):
+    """原始分辨率可见差异率(>20灰度像素占比)。
+    纯编码副本≈0%(像素一致仅编码不同); 含水印/文字/调色/宣传字样的版本明显>0.5%"""
+    if img_hi is None or img_lo is None:
+        return 1.0
+    if img_hi.shape != img_lo.shape:
+        h = min(img_hi.shape[0], img_lo.shape[0])
+        w = min(img_hi.shape[1], img_lo.shape[1])
+        img_hi, img_lo = img_hi[:h, :w], img_lo[:h, :w]
+    diff = np.abs(img_hi.astype(np.int16) - img_lo.astype(np.int16)).max(axis=2)
+    return float((diff > 20).mean())
+
+
 def find_visual_dup(images, sizes, thumbs, groups):
-    """返回 [(dup_idx, keep_idx)]: 组内两两比较, 分辨率接近且像素一致的(编码不同副本)。
-    必须两两比较: 组内可能有多个同分辨率副本, 而最高清可能是另一内容(漏检源)"""
+    """返回 [(dup_idx, keep_idx, diff_ratio)]: 组内两两比较, 分辨率接近且像素一致的。
+    diff_ratio = 原始分辨率可见差异率, 用于区分纯编码副本 vs 附加信息版本"""
     dups = []
     for g in groups:
         if len(g) < 2:
@@ -384,7 +399,10 @@ def find_visual_dup(images, sizes, thumbs, groups):
                     continue
                 if is_visual_dup(thumbs[high_i], sizes[high_i],
                                  thumbs[low_i], sizes[low_i]):
-                    dups.append((low_i, high_i))
+                    a = load_image(images[high_i])
+                    b = load_image(images[low_i])
+                    r = visible_diff_ratio(a, b)
+                    dups.append((low_i, high_i, r))
                     break                        # 找到一张即可, 不重复标记
     return dups
 
@@ -427,14 +445,32 @@ class UnionFind:
 
 # ------------------------------------------------------------------ 主流程
 def purge_runner(d, images, sizes, thumbs, groups, find_fn, csv_name, subdir,
-                 label, apply, yes, to_dir):
-    """通用: 找出冗余版本(find_fn) → 干跑报告 → apply 移动到 subdir → CSV 记录(可回滚)"""
+                 label, apply, yes, to_dir, manual_thresh=None):
+    """通用: 找出冗余版本(find_fn) → 干跑报告 → apply 移动到 subdir → CSV 记录(可回滚)。
+    manual_thresh: 可见差异率阈值, 超过的(hits 带 diff_ratio)不自动移, 报告"需人工决定"
+    (用于视觉重复: 纯编码副本自动移, 含水印/文字/调色等附加信息的版本留给用户)"""
     hits = find_fn(images, sizes, thumbs, groups)
     if not hits:
         print(f"[i] 未发现{label}")
         return 0
-    print(f"\n======== {label}清单 ({len(hits)} 个) ========")
-    for low_i, keep_i in hits:
+    auto, manual = [], []
+    for h in hits:
+        i, j = h[0], h[1]
+        ratio = h[2] if len(h) > 2 else None
+        if manual_thresh is not None and ratio is not None and ratio >= manual_thresh:
+            manual.append((i, j, ratio))
+        else:
+            auto.append((i, j))
+    if manual:
+        print(f"\n===== 需人工决定 ({len(manual)}) — 可见差异明显, 可能含水印/文字/调色等附加信息 =====")
+        for i, j, r in manual:
+            print(f"  [?] {images[i].name}  (可见差异 {r*100:.1f}%)  ← {images[j].name}")
+        print("============================================\n")
+    if not auto:
+        print(f"[i] 无自动{label}(发现的都需人工决定), 未移动任何文件")
+        return 0
+    print(f"\n======== {label}清单 ({len(auto)} 个) ========")
+    for low_i, keep_i in auto:
         lh, lw = sizes[low_i]
         sh, sw = sizes[keep_i]
         print(f"  [{label}] {images[low_i].name}  ({lw}x{lh})"
@@ -444,21 +480,21 @@ def purge_runner(d, images, sizes, thumbs, groups, find_fn, csv_name, subdir,
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
         w.writerow(['file', 'kept_with', 'moved_to'])
-        for low_i, keep_i in hits:
+        for low_i, keep_i in auto:
             w.writerow([images[low_i].name, images[keep_i].name, subdir])
     print(f"[i] {label}清单已写: {csv_path}")
     if not apply:
         print("[i] 干跑模式 — 未移动任何文件。确认后加 --apply 执行移动")
         return 0
     if not yes:
-        r = input(f"确认移动 {len(hits)} 个{label}到 {to_dir or (subdir + '/')}? [y/N] ").strip().lower()
+        r = input(f"确认移动 {len(auto)} 个{label}到 {to_dir or (subdir + '/')}? [y/N] ").strip().lower()
         if r != 'y':
             print("[i] 已取消")
             return 0
     target = Path(to_dir) if to_dir else (d / subdir)
     target.mkdir(parents=True, exist_ok=True)
     done = 0
-    for low_i, keep_i in hits:
+    for low_i, keep_i in auto:
         src = d / images[low_i].name
         dst = target / images[low_i].name
         if not src.exists():
@@ -472,7 +508,7 @@ def purge_runner(d, images, sizes, thumbs, groups, find_fn, csv_name, subdir,
                 k += 1
         src.rename(dst)
         done += 1
-    print(f"[✓] 已移动 {done}/{len(hits)} 个{label}到 {target}  (清单 {csv_name}, 可回滚)")
+    print(f"[✓] 已移动 {done}/{len(auto)} 个{label}到 {target}  (清单 {csv_name}, 可回滚)")
     return 0
 
 
@@ -589,7 +625,7 @@ def run_dir(d: Path, apply: bool, yes: bool, purge_lowres: bool = False,
                                 apply, yes, to_dir)
         return purge_runner(d, images, orig_sizes, thumbs, groups,
                             find_visual_dup, VDUP_CSV_NAME, '_visual_dup', '视觉重复',
-                            apply, yes, to_dir)
+                            apply, yes, to_dir, manual_thresh=AUTO_MOVE_DIFF)
 
     # --- 4) 排序 + 命名计划 ---
     plan, stats = plan_renames(images, sizes, tones, groups)
