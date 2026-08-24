@@ -57,6 +57,8 @@ SCALE_UP_DROP = 0.03       # 反向比较: sim(高清→低清) - sim(低清→�
                            # → 低清只是高清的局部巧合(如拼贴图的一个元素), 拒绝
 VISUAL_DUP_THRESH = 0.97   # 视觉重复: 分辨率接近(≥90%)且双向相似度 ≥ 该值 → 同图仅编码不同
 VISUAL_DUP_PIX_RATIO = 0.90  # 分辨率接近阈值(像素比下限)
+VISUAL_DUP_HIST_THRESH = 0.5  # HSV直方图卡方距离上限: 超过→色调不同(如暖/冷版本), 拒绝
+                            # (同色重压缩≈0.0-0.1, 色调不同版本≈1.0-2.5)
 
 
 # ------------------------------------------------------------------ IO
@@ -348,7 +350,7 @@ def is_pure_downscale(img_high, size_h, img_low, size_l):
 
 
 def is_visual_dup(img_high, size_h, img_low, size_l):
-    """img_low 是否与 img_high 视觉重复(同内容同分辨率级别, 仅编码不同)。
+    """img_low 是否与 img_high 视觉重复(同分辨率级别同内容同色, 仅编码不同)。
     JPEG/PNG 编码非唯一: 同像素内容不同压缩/保存 → 字节哈希不同但视觉一致"""
     px_h = size_h[0] * size_h[1]
     px_l = size_l[0] * size_l[1]
@@ -356,7 +358,14 @@ def is_visual_dup(img_high, size_h, img_low, size_l):
         return False
     sd = scale_similarity(img_high, img_low)
     su = scale_similarity_up(img_high, img_low)
-    return min(sd, su) >= VISUAL_DUP_THRESH
+    if min(sd, su) < VISUAL_DUP_THRESH:
+        return False
+    # 颜色一致性: 灰度构图一致≠视觉重复——色调不同(暖/冷版本)不算
+    # HSV直方图距离: 同色重压缩≈0, 色调不同版本明显大
+    d = chi2_dist(compute_hist(img_high), compute_hist(img_low))
+    if d > VISUAL_DUP_HIST_THRESH:
+        return False
+    return True
 
 
 def find_visual_dup(images, sizes, thumbs, groups):
